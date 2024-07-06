@@ -7,10 +7,47 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+#from einops import rearrange
+import math
 
 from typing import Optional, Tuple, Type
 
-from .common import LayerNorm2d, MLPBlock
+from .common import LayerNorm2d, MLPBlock, Adapter
+
+
+
+class _LoRA_qkv(nn.Module):
+    """In Sam it is implemented as
+    self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+    B, N, C = x.shape
+    qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+    q, k, v = qkv.unbind(0)
+    """
+
+    def __init__(
+            self,
+            qkv: nn.Module,
+            linear_a_q: nn.Module,
+            linear_b_q: nn.Module,
+            linear_a_v: nn.Module,
+            linear_b_v: nn.Module,
+    ):
+        super().__init__()
+        self.qkv = qkv
+        self.linear_a_q = linear_a_q
+        self.linear_b_q = linear_b_q
+        self.linear_a_v = linear_a_v
+        self.linear_b_v = linear_b_v
+        self.dim = qkv.in_features
+        self.w_identity = torch.eye(qkv.in_features)
+
+    def forward(self, x):
+        qkv = self.qkv(x)  # B,N,N,3*org_C
+        new_q = self.linear_b_q(self.linear_a_q(x))
+        new_v = self.linear_b_v(self.linear_a_v(x))
+        qkv[:, :, :, : self.dim] += new_q
+        qkv[:, :, :, -self.dim:] += new_v
+        return qkv
 
 
 # This class and its supporting functions below lightly adapted from the ViTDet backbone available at: https://github.com/facebookresearch/detectron2/blob/main/detectron2/modeling/backbone/vit.py # noqa
@@ -55,6 +92,7 @@ class ImageEncoderViT(nn.Module):
         """
         super().__init__()
         self.img_size = img_size
+        self.in_chans = in_chans
         self.args = args
 
         self.patch_embed = PatchEmbed(
@@ -153,6 +191,7 @@ class Block(nn.Module):
                 positional parameter size.
         """
         super().__init__()
+        self.r = 4
         self.args = args
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
@@ -163,7 +202,20 @@ class Block(nn.Module):
             rel_pos_zero_init=rel_pos_zero_init,
             input_size=input_size if window_size == 0 else (window_size, window_size),
         )
-
+        self.w_As = []  # These are linear layers
+        self.w_Bs = []
+        w_qkv_linear = self.attn.qkv
+        self.w_a_linear_q = nn.Linear(dim, self.r, bias=False)
+        self.w_b_linear_q = nn.Linear(self.r, dim, bias=False)
+        self.w_a_linear_v = nn.Linear(dim, self.r, bias=False)
+        self.w_b_linear_v = nn.Linear(self.r, dim, bias=False)
+        self.attn.qkv = _LoRA_qkv(
+            w_qkv_linear,
+            self.w_a_linear_q,
+            self.w_b_linear_q,
+            self.w_a_linear_v,
+            self.w_b_linear_v,
+            )
         self.norm2 = norm_layer(dim)
         self.mlp = MLPBlock(embedding_dim=dim, mlp_dim=int(dim * mlp_ratio), act=act_layer)
 
@@ -171,20 +223,36 @@ class Block(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shortcut = x
-        x = self.norm1(x)
         # Window partition
         if self.window_size > 0:
             H, W = x.shape[1], x.shape[2]
             x, pad_hw = window_partition(x, self.window_size)
 
+        # ## 3d branch
+        # if self.args.thd: 
+        #     hh, ww = x.shape[1], x.shape[2]
+        #     depth = self.args.chunk
+        #     xd = rearrange(x, '(b d) h w c -> (b h w) d c ', d=depth)
+        #     # xd = rearrange(xd, '(b d) n c -> (b n) d c', d=self.in_chans)
+        #     xd = self.norm1(xd)
+        #     dh, _ = closest_numbers(depth)
+        #     xd = rearrange(xd, 'bhw (dh dw) c -> bhw dh dw c', dh= dh)
+        #     xd = self.Depth_Adapter(self.attn(xd))
+        #     xd = rearrange(xd, '(b n) dh dw c ->(b dh dw) n c', n= hh * ww )
+        
+        x = self.norm1(x)
         x = self.attn(x)
+
+        # if self.args.thd:
+        #     xd = rearrange(xd, 'b (hh ww) c -> b  hh ww c', hh= hh )
+        #     x = x + xd
         # Reverse window partition
         if self.window_size > 0:
             x = window_unpartition(x, self.window_size, pad_hw, (H, W))
-
+        
         x = shortcut + x
-        x = x + self.mlp(self.norm2(x))
 
+        x = x + self.mlp(self.norm2(x))
         return x
 
 
@@ -365,6 +433,17 @@ def add_decomposed_rel_pos(
     ).view(B, q_h * q_w, k_h * k_w)
 
     return attn
+
+def closest_numbers(target):
+    a = int(target ** 0.5)
+    b = a + 1
+    while True:
+        if a * b == target:
+            return (a, b)
+        elif a * b < target:
+            b += 1
+        else:
+            a -= 1
 
 
 class PatchEmbed(nn.Module):

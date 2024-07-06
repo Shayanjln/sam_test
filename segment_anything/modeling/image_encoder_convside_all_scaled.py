@@ -1,4 +1,4 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
+ # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
 # This source code is licensed under the license found in the
@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from typing import Optional, Tuple, Type
 
-from .common import LayerNorm2d, MLPBlock
+from .common import LayerNorm2d, MLPBlock, ConvBlock, Conv_Scale_Block, Conv_All_Scale_Block
 
 
 # This class and its supporting functions below lightly adapted from the ViTDet backbone available at: https://github.com/facebookresearch/detectron2/blob/main/detectron2/modeling/backbone/vit.py # noqa
@@ -72,6 +72,7 @@ class ImageEncoderViT(nn.Module):
             )
 
         self.blocks = nn.ModuleList()
+        self.convblocks = nn.ModuleList()
         for i in range(depth):
             block = Block(
                 args= self.args,
@@ -87,6 +88,9 @@ class ImageEncoderViT(nn.Module):
                 input_size=(img_size // patch_size, img_size // patch_size),
             )
             self.blocks.append(block)
+            convblock = Conv_All_Scale_Block(embed_dim,16)
+            self.convblocks.append(convblock)            
+            
 
         self.neck = nn.Sequential(
             nn.Conv2d(
@@ -106,14 +110,24 @@ class ImageEncoderViT(nn.Module):
             LayerNorm2d(out_chans),
         )
 
+        ####
+        self.scale = torch.nn.parameter.Parameter(torch.tensor(0.5))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.patch_embed(x)
         if self.pos_embed is not None:
             x = x + self.pos_embed
 
-        for blk in self.blocks:
-            x = blk(x)
+        xc = torch.zeros_like(x)
+        for blk,convblk in zip(self.blocks,self.convblocks):
+            xt = x
+            inp = xt + self.scale*xc
+            xc = convblk(inp)
+            #x = blk(xt)
+        ########
+            x = blk(xt+ self.scale*xc)
 
+        x = x + self.scale*xc
         x = self.neck(x.permute(0, 3, 1, 2))
 
         return x

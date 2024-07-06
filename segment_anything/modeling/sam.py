@@ -21,6 +21,7 @@ class Sam(nn.Module):
 
     def __init__(
         self,
+        args,
         image_encoder: ImageEncoderViT,
         prompt_encoder: PromptEncoder,
         mask_decoder: MaskDecoder,
@@ -40,6 +41,7 @@ class Sam(nn.Module):
           pixel_std (list(float)): Std values for normalizing pixels in the input image.
         """
         super().__init__()
+        self.args = args
         self.image_encoder = image_encoder
         self.prompt_encoder = prompt_encoder
         self.mask_decoder = mask_decoder
@@ -50,8 +52,38 @@ class Sam(nn.Module):
     def device(self) -> Any:
         return self.pixel_mean.device
 
+
+    def forward(self, inputs):
+
+        imgs , points , point_labels = inputs
+                
+        points_input=(points.unsqueeze(1),point_labels.unsqueeze(1))
+
+
+        encoded_img = self.image_encoder(imgs)
+        
+        with torch.no_grad():
+            
+            se, de = self.prompt_encoder(
+              points=points_input,
+              boxes=None,
+              masks=None,
+            )
+
+        pred, _ = self.mask_decoder(
+          image_embeddings=encoded_img,
+          image_pe=self.prompt_encoder.get_dense_pe(),
+          sparse_prompt_embeddings=se,
+          dense_prompt_embeddings=de,
+          multimask_output=False,
+        )
+
+
+        
+        return pred
+
     @torch.no_grad()
-    def forward(
+    def forward_orig(
         self,
         batched_input: List[Dict[str, Any]],
         multimask_output: bool,
