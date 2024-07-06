@@ -3,16 +3,58 @@
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-
+from functools import partial
+from pathlib import Path
+import urllib.request
 import torch
 
-from functools import partial
+from .modeling import (
+    IE_Vanilla, #as ImageEncoderViT,
+    IE_Lora,
+    IE_Mix,
+    IE_Parallel,
+    IE_Series,
+    IE_Convside,
+    IE_Convside_Scaled,
+    IE_Convside_All_Scaled,
+    #ImageEncoderViT,
+    MaskDecoder,
+    PromptEncoder,
+    Sam,
+    TwoWayTransformer,
+)
 
-from .modeling import ImageEncoderViT, MaskDecoder, PromptEncoder, Sam, TwoWayTransformer
+def choose_image_encoder_vit(net_type: str):
+    type_selected = False
+    if net_type == 'Lora':
+        IE = IE_Lora
+    elif net_type == 'Mix':
+        IE = IE_Mix
+    elif net_type == 'Parallel':
+        IE = IE_Parallel
+    elif net_type == 'Series':
+        IE = IE_Series
+    elif net_type == 'Convside':
+        IE = IE_Convside
+    elif net_type == 'Convside_Scaled':
+        IE = IE_Convside_Scaled
+    elif net_type == 'Convside_All_Scaled':
+        IE = IE_Convside_All_Scaled
+    else:
+        IE = IE_Vanilla
+        type_selected = 'Vanilla'
+
+    if type_selected:
+        print(f'net type: {type_selected}')
+    else:
+        print(f'net type: {net_type}')
+    return IE
 
 
-def build_sam_vit_h(checkpoint=None):
+
+def build_sam_vit_h(args = None, checkpoint=None):
     return _build_sam(
+        args,
         encoder_embed_dim=1280,
         encoder_depth=32,
         encoder_num_heads=16,
@@ -21,11 +63,12 @@ def build_sam_vit_h(checkpoint=None):
     )
 
 
-build_sam = build_sam_vit_h
+#build_sam = build_sam_vit_h
 
 
-def build_sam_vit_l(checkpoint=None):
+def build_sam_vit_l(args, checkpoint=None):
     return _build_sam(
+        args,
         encoder_embed_dim=1024,
         encoder_depth=24,
         encoder_num_heads=16,
@@ -34,8 +77,9 @@ def build_sam_vit_l(checkpoint=None):
     )
 
 
-def build_sam_vit_b(checkpoint=None):
+def build_sam_vit_b(args, checkpoint=None):
     return _build_sam(
+        args,
         encoder_embed_dim=768,
         encoder_depth=12,
         encoder_num_heads=12,
@@ -45,7 +89,7 @@ def build_sam_vit_b(checkpoint=None):
 
 
 sam_model_registry = {
-    "default": build_sam_vit_h,
+    "default": build_sam_vit_b,
     "vit_h": build_sam_vit_h,
     "vit_l": build_sam_vit_l,
     "vit_b": build_sam_vit_b,
@@ -53,6 +97,7 @@ sam_model_registry = {
 
 
 def _build_sam(
+    args,
     encoder_embed_dim,
     encoder_depth,
     encoder_num_heads,
@@ -63,8 +108,11 @@ def _build_sam(
     image_size = 1024
     vit_patch_size = 16
     image_embedding_size = image_size // vit_patch_size
+    ImageEncoderViT = choose_image_encoder_vit(args.net_type)
     sam = Sam(
+        args,
         image_encoder=ImageEncoderViT(
+            args = args,
             depth=encoder_depth,
             embed_dim=encoder_embed_dim,
             img_size=image_size,
@@ -100,8 +148,42 @@ def _build_sam(
         pixel_std=[58.395, 57.12, 57.375],
     )
     sam.eval()
+    checkpoint = Path(checkpoint)
+    if checkpoint.name == "sam_vit_b_01ec64.pth" and not checkpoint.exists():
+        cmd = input("Download sam_vit_b_01ec64.pth from facebook AI? [y]/n: ")
+        if len(cmd) == 0 or cmd.lower() == 'y':
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            print("Downloading SAM ViT-B checkpoint...")
+            urllib.request.urlretrieve(
+                "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth",
+                checkpoint,
+            )
+            print(checkpoint.name, " is downloaded!")
+    elif checkpoint.name == "sam_vit_h_4b8939.pth" and not checkpoint.exists():
+        cmd = input("Download sam_vit_h_4b8939.pth from facebook AI? [y]/n: ")
+        if len(cmd) == 0 or cmd.lower() == 'y':
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            print("Downloading SAM ViT-H checkpoint...")
+            urllib.request.urlretrieve(
+                "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth",
+                checkpoint,
+            )
+            print(checkpoint.name, " is downloaded!")
+    elif checkpoint.name == "sam_vit_l_0b3195.pth" and not checkpoint.exists():
+        cmd = input("Download sam_vit_l_0b3195.pth from facebook AI? [y]/n: ")
+        if len(cmd) == 0 or cmd.lower() == 'y':
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            print("Downloading SAM ViT-L checkpoint...")
+            urllib.request.urlretrieve(
+                "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth",
+                checkpoint,
+            )
+            print(checkpoint.name, " is downloaded!")
+
+        
     if checkpoint is not None:
         with open(checkpoint, "rb") as f:
             state_dict = torch.load(f)
-        sam.load_state_dict(state_dict)
+        sam.load_state_dict(state_dict, strict = False)
     return sam
+

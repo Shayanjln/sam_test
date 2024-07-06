@@ -7,11 +7,29 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
+import math
 
 from typing import Optional, Tuple, Type
 
-from .common import LayerNorm2d, MLPBlock
+from .common import LayerNorm2d, MLPBlock, Adapter
 
+
+
+# def upscale_pos_embed(pos_embed):
+#     # pos_embed: (1, 64, 64, 768)
+#     # scale_factor: 缩放因子，此处为2
+
+#     # 将pos_embed的维度调整为 (1, 768, 64, 64)
+#     pos_embed = pos_embed.permute(0, 3, 1, 2)
+
+#     # 使用双线性插值将pos_embed扩展为目标尺寸 (1, 768, 128, 128)
+#     pos_embed = F.interpolate(pos_embed, size = (128,128), mode='bilinear')
+
+#     # 调整维度顺序为 (1, 128, 128, 768)
+#     pos_embed = pos_embed.permute(0, 2, 3, 1)
+
+#     return pos_embed
 
 # This class and its supporting functions below lightly adapted from the ViTDet backbone available at: https://github.com/facebookresearch/detectron2/blob/main/detectron2/modeling/backbone/vit.py # noqa
 class ImageEncoderViT(nn.Module):
@@ -55,6 +73,7 @@ class ImageEncoderViT(nn.Module):
         """
         super().__init__()
         self.img_size = img_size
+        self.in_chans = in_chans
         self.args = args
 
         self.patch_embed = PatchEmbed(
@@ -109,6 +128,7 @@ class ImageEncoderViT(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.patch_embed(x)
         if self.pos_embed is not None:
+            # self.upscaled_pos_embed = upscale_pos_embed(self.pos_embed)
             x = x + self.pos_embed
 
         for blk in self.blocks:
@@ -163,6 +183,10 @@ class Block(nn.Module):
             rel_pos_zero_init=rel_pos_zero_init,
             input_size=input_size if window_size == 0 else (window_size, window_size),
         )
+        self.MLP_Adapter = Adapter(dim, skip_connect=False)  # MLP-adapter, no skip connection
+        self.Space_Adapter = Adapter(dim)  # with skip connection
+        self.scale = scale
+        self.Depth_Adapter = Adapter(dim, skip_connect=False)  # no skip connection
 
         self.norm2 = norm_layer(dim)
         self.mlp = MLPBlock(embedding_dim=dim, mlp_dim=int(dim * mlp_ratio), act=act_layer)
@@ -171,20 +195,43 @@ class Block(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shortcut = x
-        x = self.norm1(x)
         # Window partition
         if self.window_size > 0:
             H, W = x.shape[1], x.shape[2]
             x, pad_hw = window_partition(x, self.window_size)
 
-        x = self.attn(x)
+        ## 3d branch
+        
+        if self.args.thd: 
+          hh, ww = x.shape[1], x.shape[2]
+          depth = self.args.chunk
+          xd = rearrange(x, '(b d) h w c -> (b h w) d c ', d=depth)
+          # xd = rearrange(xd, '(b d) n c -> (b n) d c', d=self.in_chans)
+          xd = self.norm1(xd)
+          dh, _ = closest_numbers(depth)
+          xd = rearrange(xd, 'bhw (dh dw) c -> bhw dh dw c', dh= dh)
+          xd = self.Depth_Adapter(self.attn(xd))
+          xd = rearrange(xd, '(b n) dh dw c ->(b dh dw) n c', n= hh * ww )
+
+          x = self.norm1(x)
+          x = self.attn(x)
+            
+        x = self.Space_Adapter(x)
+
+        if self.args.thd:
+            xd = rearrange(xd, 'b (hh ww) c -> b  hh ww c', hh= hh )
+            x = x + xd
         # Reverse window partition
         if self.window_size > 0:
             x = window_unpartition(x, self.window_size, pad_hw, (H, W))
 
         x = shortcut + x
-        x = x + self.mlp(self.norm2(x))
 
+        xn = self.norm2(x)
+        x = x + self.mlp(xn)
+        
+        x = x + self.scale * self.MLP_Adapter(xn)
+        #x = x + self.mlp(xn) + self.scale * self.MLP_Adapter(xn)
         return x
 
 
@@ -365,6 +412,17 @@ def add_decomposed_rel_pos(
     ).view(B, q_h * q_w, k_h * k_w)
 
     return attn
+
+def closest_numbers(target):
+    a = int(target ** 0.5)
+    b = a + 1
+    while True:
+        if a * b == target:
+            return (a, b)
+        elif a * b < target:
+            b += 1
+        else:
+            a -= 1
 
 
 class PatchEmbed(nn.Module):
